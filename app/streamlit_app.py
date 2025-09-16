@@ -86,15 +86,21 @@ UNCERTAIN_PATTERNS = r"""(
 )"""
 
 def classify_text(text: str):
-    if classifier:  # transformers path
+    if classifier:  # transformers path, single text
+        LABEL_MAP = {
+            "AI is sentient": "Yes",
+            "AI is not sentient": "No",
+            "It is uncertain whether AI is sentient": "Uncertain"
+        }
         result = classifier(
-            text,
-            candidate_labels=LABELS,
-            hypothesis_template="This text argues that AI {} be sentient."
+            text,  # just one string here
+            candidate_labels=list(LABEL_MAP.keys()),
+            hypothesis_template="{}",
+            truncation=True
         )
         label = result["labels"][0]
         score = float(result["scores"][0])
-        return label, score
+        return LABEL_MAP[label], score
 
     # Regex fallback path
     text_l = text.lower()
@@ -106,14 +112,34 @@ def classify_text(text: str):
         return "Uncertain", 0.7
     return "Uncertain", 0.5
 
+
+
 @st.cache_data(show_spinner=True)
 def classify_all(texts):
+    if classifier:  # transformers path, batched
+        LABEL_MAP = {
+            "AI is sentient": "Yes",
+            "AI is not sentient": "No",
+            "It is uncertain whether AI is sentient": "Uncertain"
+        }
+        results = classifier(
+            texts,  # list of strings
+            candidate_labels=list(LABEL_MAP.keys()),
+            hypothesis_template="{}",
+            truncation=True
+        )
+        labels = [LABEL_MAP[r["labels"][0]] for r in results]
+        scores = [float(r["scores"][0]) for r in results]
+        return pd.DataFrame({"stance": labels, "confidence": scores})
+
+    # Regex fallback path
     labels, scores = [], []
     for t in texts:
         l, s = classify_text(t)
         labels.append(l)
         scores.append(s)
     return pd.DataFrame({"stance": labels, "confidence": scores})
+
 
 with st.spinner("Classifying documents..."):
     results = classify_all(df["full_text"].tolist())
