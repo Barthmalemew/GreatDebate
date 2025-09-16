@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -37,12 +39,11 @@ def doc_text(row):
 df["full_text"] = df.apply(doc_text, axis=1)
 
 # --------------------------
-# Stance classifier
+# Classifier setup
 # --------------------------
 LABELS = ["Yes", "No", "Uncertain"]
 
-# Sidebar toggle for regex
-USE_REGEX = st.sidebar.checkbox("Use regex fallback (debug mode)", value=False)
+USE_REGEX = st.sidebar.checkbox("Use regex fallback only", value=False)
 
 classifier = None
 if not USE_REGEX:
@@ -51,14 +52,16 @@ if not USE_REGEX:
         classifier = pipeline(
             "zero-shot-classification",
             model="facebook/bart-large-mnli",
-            device=0  # use GPU (ROCm) if available
+            device=0  # use GPU if available
         )
         st.sidebar.success("Using HuggingFace zero-shot classifier (GPU if available)")
     except Exception as e:
         st.sidebar.error(f"Failed to load transformers pipeline: {e}")
         USE_REGEX = True
 
-# Regex patterns for fallback
+# --------------------------
+# Regex patterns
+# --------------------------
 YES_PATTERNS = r"""(
     (is|are|becomes?|has|shows|demonstrates?)\s+(sentient|conscious|self[- ]aware)|
     (artificial|machine)\s+(consciousness|awareness|sentience)|
@@ -68,6 +71,7 @@ YES_PATTERNS = r"""(
 
 NO_PATTERNS = r"""(
     (not|never|cannot|can't|won't|isn't|aren't)\s+(sentient|conscious|self[- ]aware)|
+    (does\s+not|fails?\s+to|unlikely\s+to)\s+(show|exhibit|possess)\s+(consciousness|awareness|sentience)|
     lacks?\s+(sentience|consciousness|awareness)|
     no\s+(evidence|sign|proof|basis)\s+(of|for)\s+(sentience|consciousness|awareness)|
     merely\s+(a|an)\s+(tool|program|system|simulation|statistical model)|
@@ -85,62 +89,62 @@ UNCERTAIN_PATTERNS = r"""(
     unclear\s+if\s+(AI|machines?)\s+(are|can be)\s+(sentient|conscious)
 )"""
 
-def classify_text(text: str):
-    if classifier:  # transformers path, single text
-        LABEL_MAP = {
-            "AI is sentient": "Yes",
-            "AI is not sentient": "No",
-            "It is uncertain whether AI is sentient": "Uncertain"
-        }
-        result = classifier(
-            text,  # just one string here
-            candidate_labels=list(LABEL_MAP.keys()),
-            hypothesis_template="{}",
-            truncation=True
-        )
-        label = result["labels"][0]
-        score = float(result["scores"][0])
-        return LABEL_MAP[label], score
-
-    # Regex fallback path
-    text_l = text.lower()
-    if re.search(NO_PATTERNS, text_l):
-        return "No", 0.9
-    elif re.search(YES_PATTERNS, text_l):
-        return "Yes", 0.8
-    elif re.search(UNCERTAIN_PATTERNS, text_l):
-        return "Uncertain", 0.7
-    return "Uncertain", 0.5
-
-
-
+# --------------------------
+# Unified batch classifier
+# --------------------------
 @st.cache_data(show_spinner=True)
-def classify_all(texts):
-    if classifier:  # transformers path, batched
-        LABEL_MAP = {
-            "AI is sentient": "Yes",
-            "AI is not sentient": "No",
-            "It is uncertain whether AI is sentient": "Uncertain"
-        }
-        results = classifier(
-            texts,  # list of strings
-            candidate_labels=list(LABEL_MAP.keys()),
-            hypothesis_template="{}",
-            truncation=True
-        )
-        labels = [LABEL_MAP[r["labels"][0]] for r in results]
-        scores = [float(r["scores"][0]) for r in results]
-        return pd.DataFrame({"stance": labels, "confidence": scores})
-
-    # Regex fallback path
+def classify_all(texts, batch_size: int = 8):
     labels, scores = [], []
-    for t in texts:
-        l, s = classify_text(t)
-        labels.append(l)
-        scores.append(s)
+
+    if classifier:  # HuggingFace path
+        total = len(texts)
+        for i in range(0, total, batch_size):
+            batch = texts[i:i+batch_size]
+
+            results = classifier(
+                batch,
+                candidate_labels=["Yes", "No", "Uncertain"],
+                hypothesis_template="This text suggests that AI sentience is {}.",
+                truncation=True
+            )
+
+            if isinstance(results, dict):
+                results = [results]
+
+            for text, res in zip(batch, results):
+                label = res["labels"][0]
+                score = float(res["scores"][0])
+                mapped = label  # already "Yes"/"No"/"Uncertain"
+
+                # Regex override
+                text_l = text.lower()
+                if re.search(NO_PATTERNS, text_l):
+                    mapped, score = "No", max(score, 0.95)
+                elif re.search(YES_PATTERNS, text_l):
+                    mapped, score = "Yes", max(score, 0.85)
+                elif re.search(UNCERTAIN_PATTERNS, text_l):
+                    mapped, score = "Uncertain", max(score, 0.8)
+
+                labels.append(mapped)
+                scores.append(score)
+
+    else:  # Regex-only fallback
+        for text in texts:
+            text_l = text.lower()
+            if re.search(NO_PATTERNS, text_l):
+                labels.append("No"); scores.append(0.9)
+            elif re.search(YES_PATTERNS, text_l):
+                labels.append("Yes"); scores.append(0.8)
+            elif re.search(UNCERTAIN_PATTERNS, text_l):
+                labels.append("Uncertain"); scores.append(0.7)
+            else:
+                labels.append("Uncertain"); scores.append(0.5)
+
     return pd.DataFrame({"stance": labels, "confidence": scores})
 
-
+# --------------------------
+# Run classification
+# --------------------------
 with st.spinner("Classifying documents..."):
     results = classify_all(df["full_text"].tolist())
 
@@ -237,6 +241,11 @@ def list_topics(x):
     except Exception:
         return ""
 df["topic_list"] = df["topics"].apply(list_topics)
-st.dataframe(df[["title", "topic_list", "stance", "year"]].sort_values("year", ascending=False).head(200), use_container_width=True)
+st.dataframe(
+    df[["title", "topic_list", "stance", "year"]]
+    .sort_values("year", ascending=False)
+    .head(200),
+    use_container_width=True
+)
 
-st.caption("💡 Using HuggingFace zero-shot classification (or regex fallback if selected) to detect stance on AI sentience (Yes / No / Uncertain).")
+st.caption("💡 Using HuggingFace zero-shot classification with regex safeguards (or regex fallback) to detect stance on AI sentience (Yes / No / Uncertain).")
