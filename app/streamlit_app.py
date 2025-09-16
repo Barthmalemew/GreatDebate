@@ -9,8 +9,8 @@ from datetime import datetime
 import altair as alt
 import re
 
-st.set_page_config(page_title="AI Sentience Opinion Scanner", layout="wide")
-st.title("🧠 AI Sentience Opinion Scanner")
+st.set_page_config(page_title="Great Debate", layout="wide")
+st.title("🧠 Great Debate")
 
 # --------------------------
 # Load database
@@ -92,6 +92,9 @@ UNCERTAIN_PATTERNS = r"""(
 # --------------------------
 # Unified batch classifier
 # --------------------------
+# --------------------------
+# Unified batch classifier (improved)
+# --------------------------
 @st.cache_data(show_spinner=True)
 def classify_all(texts, batch_size: int = 8):
     labels, scores = [], []
@@ -107,40 +110,61 @@ def classify_all(texts, batch_size: int = 8):
                 hypothesis_template="This text suggests that AI sentience is {}.",
                 truncation=True
             )
-
             if isinstance(results, dict):
                 results = [results]
 
             for text, res in zip(batch, results):
-                label = res["labels"][0]
-                score = float(res["scores"][0])
-                mapped = label  # already "Yes"/"No"/"Uncertain"
-
-                # Regex override
                 text_l = text.lower()
+                scores_dict = {lab: float(sc) for lab, sc in zip(res["labels"], res["scores"])}
+
+                # regex boosters
                 if re.search(NO_PATTERNS, text_l):
-                    mapped, score = "No", max(score, 0.95)
-                elif re.search(YES_PATTERNS, text_l):
-                    mapped, score = "Yes", max(score, 0.85)
-                elif re.search(UNCERTAIN_PATTERNS, text_l):
-                    mapped, score = "Uncertain", max(score, 0.8)
+                    scores_dict["No"] += 0.25
+                if re.search(YES_PATTERNS, text_l):
+                    scores_dict["Yes"] += 0.2
+                if re.search(UNCERTAIN_PATTERNS, text_l):
+                    scores_dict["Uncertain"] += 0.05
+
+                # normalize
+                total_score = sum(scores_dict.values())
+                for k in scores_dict:
+                    scores_dict[k] /= total_score
+
+                # sorted scores
+                sorted_scores = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
+                best, best_score = sorted_scores[0]
+                second, second_score = sorted_scores[1]
+
+                # --- Shrink "Uncertain" logic ---
+                if best_score < 0.4:
+                    mapped, final_score = "Uncertain", best_score
+                elif best == "Uncertain":
+                    if abs(scores_dict["Yes"] - scores_dict["No"]) < 0.15:
+                        # close call → choose whichever is higher
+                        mapped = "Yes" if scores_dict["Yes"] >= scores_dict["No"] else "No"
+                        final_score = max(scores_dict["Yes"], scores_dict["No"])
+                    else:
+                        mapped, final_score = "Uncertain", best_score
+                else:
+                    mapped, final_score = best, best_score
 
                 labels.append(mapped)
-                scores.append(score)
+                scores.append(final_score)
 
     else:  # Regex-only fallback
         for text in texts:
             text_l = text.lower()
             if re.search(NO_PATTERNS, text_l):
-                labels.append("No"); scores.append(0.9)
+                labels.append("No"); scores.append(0.85)
             elif re.search(YES_PATTERNS, text_l):
-                labels.append("Yes"); scores.append(0.8)
+                labels.append("Yes"); scores.append(0.75)
             elif re.search(UNCERTAIN_PATTERNS, text_l):
-                labels.append("Uncertain"); scores.append(0.7)
+                labels.append("Uncertain"); scores.append(0.6)
             else:
-                labels.append("Uncertain"); scores.append(0.5)
+                labels.append("No"); scores.append(0.55)  # default lean No
 
     return pd.DataFrame({"stance": labels, "confidence": scores})
+
 
 # --------------------------
 # Run classification
