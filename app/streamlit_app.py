@@ -45,19 +45,20 @@ LABELS = ["Yes", "No", "Uncertain"]
 
 USE_REGEX = st.sidebar.checkbox("Use regex fallback only", value=False)
 
-classifier = None
-if not USE_REGEX:
-    try:
-        from transformers import pipeline
-        classifier = pipeline(
-            "zero-shot-classification",
-            model="facebook/bart-large-mnli",
-            device=0  # use GPU if available
-        )
-        st.sidebar.success("Using HuggingFace zero-shot classifier (GPU if available)")
-    except Exception as e:
-        st.sidebar.error(f"Failed to load transformers pipeline: {e}")
-        USE_REGEX = True
+@st.cache_resource
+def load_classifier():
+    from transformers import pipeline
+    return pipeline(
+        "zero-shot-classification",
+        model="facebook/bart-large-mnli",
+        device=0  # use GPU if available
+    )
+
+classifier = None if USE_REGEX else load_classifier()
+if classifier:
+    st.sidebar.success("Using HuggingFace zero-shot classifier (GPU if available)")
+else:
+    st.sidebar.warning("Using regex-only fallback.")
 
 # --------------------------
 # Regex patterns
@@ -92,66 +93,10 @@ UNCERTAIN_PATTERNS = r"""(
 # --------------------------
 # Unified batch classifier
 # --------------------------
-# --------------------------
-# Unified batch classifier (improved)
-# --------------------------
 @st.cache_data(show_spinner=True)
-def classify_all(texts, batch_size: int = 8):
-    labels, scores = [], []
-
-    if classifier:  # HuggingFace path
-        total = len(texts)
-        for i in range(0, total, batch_size):
-            batch = texts[i:i+batch_size]
-
-            results = classifier(
-                batch,
-                candidate_labels=["Yes", "No", "Uncertain"],
-                hypothesis_template="This text suggests that AI sentience is {}.",
-                truncation=True
-            )
-            if isinstance(results, dict):
-                results = [results]
-
-            for text, res in zip(batch, results):
-                text_l = text.lower()
-                scores_dict = {lab: float(sc) for lab, sc in zip(res["labels"], res["scores"])}
-
-                # regex boosters
-                if re.search(NO_PATTERNS, text_l):
-                    scores_dict["No"] += 0.25
-                if re.search(YES_PATTERNS, text_l):
-                    scores_dict["Yes"] += 0.2
-                if re.search(UNCERTAIN_PATTERNS, text_l):
-                    scores_dict["Uncertain"] += 0.05
-
-                # normalize
-                total_score = sum(scores_dict.values())
-                for k in scores_dict:
-                    scores_dict[k] /= total_score
-
-                # sorted scores
-                sorted_scores = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
-                best, best_score = sorted_scores[0]
-                second, second_score = sorted_scores[1]
-
-                # --- Shrink "Uncertain" logic ---
-                if best_score < 0.4:
-                    mapped, final_score = "Uncertain", best_score
-                elif best == "Uncertain":
-                    if abs(scores_dict["Yes"] - scores_dict["No"]) < 0.15:
-                        # close call → choose whichever is higher
-                        mapped = "Yes" if scores_dict["Yes"] >= scores_dict["No"] else "No"
-                        final_score = max(scores_dict["Yes"], scores_dict["No"])
-                    else:
-                        mapped, final_score = "Uncertain", best_score
-                else:
-                    mapped, final_score = best, best_score
-
-                labels.append(mapped)
-                scores.append(final_score)
-
-    else:  # Regex-only fallback
+def classify_all(texts):
+    if not classifier:  # Regex-only fallback
+        labels, scores = [], []
         for text in texts:
             text_l = text.lower()
             if re.search(NO_PATTERNS, text_l):
@@ -162,9 +107,57 @@ def classify_all(texts, batch_size: int = 8):
                 labels.append("Uncertain"); scores.append(0.6)
             else:
                 labels.append("No"); scores.append(0.55)  # default lean No
+        return pd.DataFrame({"stance": labels, "confidence": scores})
+
+    # HuggingFace GPU path (dataset batching)
+    results = classifier(
+        texts,
+        candidate_labels=["Yes", "No", "Uncertain"],
+        hypothesis_template="This text suggests that AI sentience is {}.",
+        truncation=True,
+        batch_size=32
+    )
+    if isinstance(results, dict):  # single text edge case
+        results = [results]
+
+    labels, scores = [], []
+    for text, res in zip(texts, results):
+        text_l = text.lower()
+        scores_dict = {lab: float(sc) for lab, sc in zip(res["labels"], res["scores"])}
+
+        # regex boosters
+        if re.search(NO_PATTERNS, text_l):
+            scores_dict["No"] += 0.25
+        if re.search(YES_PATTERNS, text_l):
+            scores_dict["Yes"] += 0.2
+        if re.search(UNCERTAIN_PATTERNS, text_l):
+            scores_dict["Uncertain"] += 0.05
+
+        # normalize
+        total_score = sum(scores_dict.values())
+        for k in scores_dict:
+            scores_dict[k] /= total_score
+
+        # shrink "Uncertain"
+        sorted_scores = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
+        best, best_score = sorted_scores[0]
+        second, second_score = sorted_scores[1]
+
+        if best_score < 0.4:
+            mapped, final_score = "Uncertain", best_score
+        elif best == "Uncertain":
+            if abs(scores_dict["Yes"] - scores_dict["No"]) < 0.15:
+                mapped = "Yes" if scores_dict["Yes"] >= scores_dict["No"] else "No"
+                final_score = max(scores_dict["Yes"], scores_dict["No"])
+            else:
+                mapped, final_score = "Uncertain", best_score
+        else:
+            mapped, final_score = best, best_score
+
+        labels.append(mapped)
+        scores.append(final_score)
 
     return pd.DataFrame({"stance": labels, "confidence": scores})
-
 
 # --------------------------
 # Run classification
@@ -212,7 +205,6 @@ with right:
         )
         .properties(width=300, height=300)
     )
-
     st.altair_chart(pie, use_container_width=True)
 
 # --------------------------

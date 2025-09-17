@@ -1,70 +1,58 @@
+# src/ai_opinion/db.py
 import sqlite3
-from pathlib import Path
-from typing import Iterable
-from .types import Article
 import json
 from datetime import datetime
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS articles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    external_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    authors TEXT NOT NULL, -- json list
-    abstract TEXT,
-    url TEXT,
-    published TEXT,
-    venue TEXT,
-    topics TEXT, -- json list
-    sentiment_compound REAL,
-    relevance_score REAL, -- NEW: how relevant this is to AI sentience
-    added_at TEXT NOT NULL,
-    UNIQUE(source, external_id)
-);
-"""
+from typing import Iterable
+from .types import Article
 
 class DB:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute(SCHEMA)
+    def __init__(self, path: str = "ai_opinion.sqlite"):
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("PRAGMA foreign_keys = ON;")
+        self.create_schema()
+
+    def create_schema(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY,
+            source TEXT,
+            external_id TEXT,
+            title TEXT,
+            authors TEXT,
+            abstract TEXT,
+            url TEXT,
+            published TEXT,
+            venue TEXT,
+            topics TEXT,
+            sentiment_compound REAL,
+            added_at TEXT,
+            UNIQUE(source, external_id)
+        )
+        """)
         self.conn.commit()
 
     def upsert_articles(self, articles: Iterable[Article]):
         cur = self.conn.cursor()
+        sql = """
+            INSERT OR IGNORE INTO articles
+            (source, external_id, title, authors, abstract, url, published, venue, topics, sentiment_compound, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
         for a in articles:
             cur.execute(
-                """
-                INSERT INTO articles
-                (source, external_id, title, authors, abstract, url, published, venue, topics, sentiment_compound, relevance_score, added_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, external_id) DO UPDATE SET
-                    title=excluded.title,
-                    authors=excluded.authors,
-                    abstract=excluded.abstract,
-                    url=excluded.url,
-                    published=excluded.published,
-                    venue=excluded.venue,
-                    topics=excluded.topics,
-                    sentiment_compound=excluded.sentiment_compound,
-                    relevance_score=excluded.relevance_score,
-                    added_at=excluded.added_at
-                """,
+                sql,
                 (
                     a.source,
                     a.external_id,
                     a.title,
-                    json.dumps(a.authors or [], ensure_ascii=False),
+                    json.dumps(a.authors, ensure_ascii=False),
                     a.abstract,
                     a.url,
-                    a.published.isoformat() if a.published else None,
-                    a.venue,
-                    json.dumps(a.topics or [], ensure_ascii=False),
-                    a.sentiment_compound,
-                    a.relevance_score,
+                    a.published.isoformat() if getattr(a, "published", None) else None,
+                    getattr(a, "venue", None),
+                    json.dumps(getattr(a, "topics", []) or [], ensure_ascii=False),
+                    getattr(a, "sentiment_compound", None),
                     datetime.utcnow().isoformat(),
                 ),
             )
@@ -72,7 +60,4 @@ class DB:
 
     def fetch_df(self):
         import pandas as pd
-        return pd.read_sql_query(
-            "SELECT * FROM articles ORDER BY published DESC NULLS LAST, id DESC",
-            self.conn,
-        )
+        return pd.read_sql_query("SELECT * FROM articles", self.conn)
